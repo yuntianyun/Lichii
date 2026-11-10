@@ -13,7 +13,8 @@
 #   5) checkout 时切到 source_branch（含补丁的分支），无需改仓库默认分支
 #   6) 无条件给 puller.cpp 的未引用函数加 [[maybe_unused]]：
 #      MSVC 报 error C5245、clang-cl 报 -Werror,-Wunused-function，一处同时解决
-#   7) 打包前自检 exe 里是否真的带 APP_POOL_PROBE / ONLINE_SERVER，
+#   7) 所有脚本输出用纯 ASCII + job env 强制 UTF-8（避开 Windows cp1252 编码崩溃）
+#   8) 打包前自检 exe 里是否真的带 APP_POOL_PROBE / ONLINE_SERVER，
 #      并确认旧的 "InfoType 31 returning 0" stub 已消失，避免又白下一个包
 
 name: Duskbloods Windows Build
@@ -49,6 +50,10 @@ jobs:
     name: Lichii Duskbloods (windows-x86_64)
     runs-on: windows-2022
     env:
+      # Windows runner 的 Python stdout 默认是 cp1252，中文 print 会抛
+      # UnicodeEncodeError；强制 UTF-8，同时下面所有脚本输出一律用 ASCII。
+      PYTHONIOENCODING: "utf-8"
+      PYTHONUTF8: "1"
       WINDOWS_LLVM_VERSION: "22.1.8"
       WINDOWS_LLVM_SHA256: "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c"
 
@@ -72,7 +77,7 @@ jobs:
           git fetch --no-tags upstream pull/552/head:pr552 pull/560/head:pr560
           git merge --no-edit pr552
           git merge --no-edit pr560
-          echo "已合并："
+          echo "Merged PRs:"
           git log --oneline -4
 
       # puller.cpp(72) 的 GequalMetWithoutDrain 位于匿名命名空间、含 static 局部变量，
@@ -87,18 +92,18 @@ jobs:
           import pathlib
           p = pathlib.Path("src/video_core/engines/puller.cpp")
           if not p.exists():
-              print("puller.cpp 不存在，跳过")
+              print("puller.cpp not found, skipped")
           else:
               t = p.read_text(encoding="utf8")
               old = "bool GequalMetWithoutDrain("
               new = "[[maybe_unused]] " + old
               if new in t:
-                  print("已经打过补丁")
+                  print("Already patched")
               elif old in t:
                   p.write_text(t.replace(old, new, 1), encoding="utf8")
-                  print("已给 GequalMetWithoutDrain 加 [[maybe_unused]]")
+                  print("Added [[maybe_unused]] to GequalMetWithoutDrain")
               else:
-                  print("源码结构已变，未做修改（clang-cl 路线另有 -Wno-unused-function 兜底）")
+                  print("Source layout changed; left untouched (clang-cl has -Wno-unused-function fallback)")
           PY
 
       - name: Set up MSVC
@@ -208,22 +213,22 @@ jobs:
           data = pathlib.Path("build/release/bin/lichii.exe").read_bytes()
           s = b"\n".join(re.findall(rb"[\x20-\x7e]{6,}", data))
           need = {
-              "EDEN_NX2_APP_POOL_PROBE  (#552 内存池)": b"EDEN_NX2_APP_POOL_PROBE",
-              "EDEN_NX2_ONLINE_SERVER   (#560 联网重定向)": b"EDEN_NX2_ONLINE_SERVER",
+              "EDEN_NX2_APP_POOL_PROBE  (#552 memory pool)": b"EDEN_NX2_APP_POOL_PROBE",
+              "EDEN_NX2_ONLINE_SERVER   (#560 online redirect)": b"EDEN_NX2_ONLINE_SERVER",
           }
           old_stub = b"InfoType 31 (remote memory size), returning 0"
           ok = True
           for label, key in need.items():
               n = s.count(key)
-              print(f"  {label}: {n} 处")
+              print(f"  {label}: {n} hit(s)")
               if not n:
                   ok = False
           n = s.count(old_stub)
-          print(f"  旧 stub (InfoType 31 返回 0): {n} 处")
+          print(f"  Old stub (InfoType 31 returns 0): {n} hit(s)")
           if n:
               ok = False
-          print("判定:", "通过 —— 这个构建带全套 Duskbloods 补丁，可以下载" if ok
-                else "失败 —— 补丁没编进去，不要使用这个 artifact")
+          print("RESULT:", "PASS - full Duskbloods patch set present" if ok
+                else "FAIL - patches missing, do not use this artifact")
           sys.exit(0 if ok else 1)
           PY
 
