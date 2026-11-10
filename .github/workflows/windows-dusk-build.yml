@@ -1,0 +1,208 @@
+# Lichii / The Duskbloods —— 带全套补丁的 Windows x86_64 构建
+#
+# 放到 fork 仓库的 .github/workflows/ 下（建议放默认分支，方便在 Actions 里看到），
+# 编译时会自动 checkout source_branch 指定的源码分支，因此无需修改仓库默认分支。
+# 然后在 Actions 页面点 "Run workflow" 即可。
+#
+# 与 cerroverb/Lichii 原 release-binaries.yml 的 Windows job 相比，改动：
+#   1) 只跑 windows-x86_64 一个 job（不跑 PGO、不跑 Linux/macOS）
+#   2) 去掉 -flto=thin + 不限并发的 --parallel —— 这是原 CI 两个 Windows job
+#      在 Build 步骤失败的最可能原因（ThinLTO 链接 + 满并发易打爆 runner 内存）
+#   3) 默认改用 MSVC cl.exe（不装 LLVM、不需要 sccache），少两个失败点
+#   4) 可自动合并 open PR #552 / #560（refs/pull/N/head 无需等合并）
+#   5) checkout 时切到 source_branch（含补丁的分支），无需改仓库默认分支
+#   6) 打包前自检 exe 里是否真的带 APP_POOL_PROBE / ONLINE_SERVER，
+#      并确认旧的 "InfoType 31 returning 0" stub 已消失，避免又白下一个包
+
+name: Duskbloods Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      merge_open_prs:
+        description: "自动合并 PR #552/#560（仅当 fork 自上游 zortos293/Lichii 时勾选；cerroverb 的 lichii-dusk 已含补丁，不要勾）"
+        type: boolean
+        default: false
+      compiler:
+        description: "编译器：MSVC 更简单；若报 C++ 语法错误（GCC 扩展）改 clang-cl 重跑"
+        type: choice
+        options:
+          - msvc
+          - clang-cl
+        default: msvc
+      source_branch:
+        description: "源码分支（含补丁的分支；fork 自上游时改成 nx2 并勾选 merge_open_prs）"
+        type: string
+        default: "lichii-dusk"
+      parallelism:
+        description: "并行编译数（Windows runner 内存有限，建议 2；OOM 时改 1）"
+        type: string
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lichii Duskbloods (windows-x86_64)
+    runs-on: windows-2022
+    env:
+      WINDOWS_LLVM_VERSION: "22.1.8"
+      WINDOWS_LLVM_SHA256: "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c"
+
+    steps:
+      # 原 CI 用 actions/checkout@v5 且不带 submodules（依赖由 CPM/cpmfile.json 拉取），照抄
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_branch }}
+          fetch-depth: 0
+
+      # open 的 PR 也能 fetch，不必等维护者合并
+      - name: "合并 Duskbloods 补丁 PR 552 / 560"
+        if: ${{ inputs.merge_open_prs }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.email "ci@users.noreply.github.com"
+          git config user.name "Dusk Build CI"
+          git remote add upstream https://github.com/zortos293/Lichii.git || true
+          git fetch --no-tags upstream pull/552/head:pr552 pull/560/head:pr560
+          git merge --no-edit pr552
+          git merge --no-edit pr560
+          echo "已合并："
+          git log --oneline -4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # clang-cl 分支：照抄原 CI 的 LLVM 安装，但 configure 里不再加 -flto=thin
+      - name: Install LLVM (clang-cl)
+        if: ${{ inputs.compiler == 'clang-cl' }}
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'llvm.exe'
+          Invoke-WebRequest -OutFile $installer "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:WINDOWS_LLVM_VERSION/LLVM-$env:WINDOWS_LLVM_VERSION-win64.exe"
+          if ((Get-FileHash -Algorithm SHA256 $installer).Hash -ne $env:WINDOWS_LLVM_SHA256) {
+            throw 'LLVM installer checksum mismatch'
+          }
+          $root = Join-Path $env:RUNNER_TEMP 'llvm'
+          Start-Process -Wait -FilePath $installer -ArgumentList '/S', "/D=$root"
+          $version = & "$root/bin/clang-cl.exe" --version
+          $version
+          "LLVM_ROOT=$($root.Replace('\', '/'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Verify Vulkan tools
+        shell: pwsh
+        run: glslangValidator --version
+
+      # ---- MSVC 路线：CMake 自动找到 cl.exe，不加 ThinLTO、不加 sccache ----
+      - name: Configure (MSVC)
+        if: ${{ inputs.compiler == 'msvc' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DLICHII_BUILD_TAG=dusk-win \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64
+
+      # ---- clang-cl 路线：与官方编译器一致，仅去掉 -flto=thin ----
+      - name: Configure (clang-cl)
+        if: ${{ inputs.compiler == 'clang-cl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags="-DWIN32 -D_WINDOWS -DNOMINMAX"
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DLICHII_BUILD_TAG=dusk-win \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=$flags" \
+            "-DCMAKE_CXX_FLAGS=-EHsc $flags"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build/release --target yuzu yuzu-cmd --parallel "${{ inputs.parallelism }}"
+
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: |
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) { throw "build/release/bin/$exe was not produced" }
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+
+      # 关键：确认补丁真的编进二进制，别再下载一个"看着新、其实没补丁"的包
+      - name: 验证 Duskbloods 补丁已进入 exe
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re, sys, pathlib
+          data = pathlib.Path("build/release/bin/lichii.exe").read_bytes()
+          s = b"\n".join(re.findall(rb"[\x20-\x7e]{6,}", data))
+          need = {
+              "EDEN_NX2_APP_POOL_PROBE  (#552 内存池)": b"EDEN_NX2_APP_POOL_PROBE",
+              "EDEN_NX2_ONLINE_SERVER   (#560 联网重定向)": b"EDEN_NX2_ONLINE_SERVER",
+          }
+          old_stub = b"InfoType 31 (remote memory size), returning 0"
+          ok = True
+          for label, key in need.items():
+              n = s.count(key)
+              print(f"  {label}: {n} 处")
+              if not n:
+                  ok = False
+          n = s.count(old_stub)
+          print(f"  旧 stub (InfoType 31 返回 0): {n} 处")
+          if n:
+              ok = False
+          print("判定:", "通过 —— 这个构建带全套 Duskbloods 补丁，可以下载" if ok
+                else "失败 —— 补丁没编进去，不要使用这个 artifact")
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-duskbloods-windows-x86_64
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 30
