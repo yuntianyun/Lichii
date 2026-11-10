@@ -8,10 +8,12 @@
 #   1) 只跑 windows-x86_64 一个 job（不跑 PGO、不跑 Linux/macOS）
 #   2) 去掉 -flto=thin + 不限并发的 --parallel —— 这是原 CI 两个 Windows job
 #      在 Build 步骤失败的最可能原因（ThinLTO 链接 + 满并发易打爆 runner 内存）
-#   3) 默认改用 MSVC cl.exe（不装 LLVM、不需要 sccache），少两个失败点
+#   3) 提供 msvc / clang-cl 两条编译路线（不装 sccache），默认 clang-cl
 #   4) 可自动合并 open PR #552 / #560（refs/pull/N/head 无需等合并）
 #   5) checkout 时切到 source_branch（含补丁的分支），无需改仓库默认分支
-#   6) 打包前自检 exe 里是否真的带 APP_POOL_PROBE / ONLINE_SERVER，
+#   6) 无条件给 puller.cpp 的未引用函数加 [[maybe_unused]]：
+#      MSVC 报 error C5245、clang-cl 报 -Werror,-Wunused-function，一处同时解决
+#   7) 打包前自检 exe 里是否真的带 APP_POOL_PROBE / ONLINE_SERVER，
 #      并确认旧的 "InfoType 31 returning 0" stub 已消失，避免又白下一个包
 
 name: Duskbloods Windows Build
@@ -24,12 +26,12 @@ on:
         type: boolean
         default: false
       compiler:
-        description: "编译器：MSVC 更简单；若报 C++ 语法错误（GCC 扩展）改 clang-cl 重跑"
+        description: "编译器：clang-cl 与官方 CI 一致（puller.cpp 未引用函数已自动加 [[maybe_unused]]，两条路线都能编过）"
         type: choice
         options:
-          - msvc
           - clang-cl
-        default: msvc
+          - msvc
+        default: clang-cl
       source_branch:
         description: "源码分支（含补丁的分支；fork 自上游时改成 nx2 并勾选 merge_open_prs）"
         type: string
@@ -72,6 +74,32 @@ jobs:
           git merge --no-edit pr560
           echo "已合并："
           git log --oneline -4
+
+      # puller.cpp(72) 的 GequalMetWithoutDrain 位于匿名命名空间、含 static 局部变量，
+      # 且全文件没有调用点（EDEN_NX2_ACQUIRE_PRECHECK 实验代码）。两个编译器都会因此失败：
+      #   MSVC    -> error C5245（/Zc:inline 移除未引用内部链接函数）
+      #   clang-cl -> error: unused function [-Werror,-Wunused-function]
+      # 加 C++17 标准属性 [[maybe_unused]] 一次解决，两条路线都要执行。
+      - name: "修复未引用函数 GequalMetWithoutDrain (puller.cpp)"
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/video_core/engines/puller.cpp")
+          if not p.exists():
+              print("puller.cpp 不存在，跳过")
+          else:
+              t = p.read_text(encoding="utf8")
+              old = "bool GequalMetWithoutDrain("
+              new = "[[maybe_unused]] " + old
+              if new in t:
+                  print("已经打过补丁")
+              elif old in t:
+                  p.write_text(t.replace(old, new, 1), encoding="utf8")
+                  print("已给 GequalMetWithoutDrain 加 [[maybe_unused]]")
+              else:
+                  print("源码结构已变，未做修改（clang-cl 路线另有 -Wno-unused-function 兜底）")
+          PY
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -155,7 +183,7 @@ jobs:
             "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
             "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
             "-DCMAKE_C_FLAGS=$flags" \
-            "-DCMAKE_CXX_FLAGS=-EHsc $flags"
+            "-DCMAKE_CXX_FLAGS=-EHsc -Wno-unused-function $flags"
 
       - name: Build
         shell: bash
